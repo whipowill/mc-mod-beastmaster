@@ -1,0 +1,20 @@
+{
+  "whistle1": {
+    "sounds": [
+      "beastmaster:whistle1"
+    ],
+    "subtitle": "Whistle"
+  },
+  "whistle2": {
+    "sounds": [
+      "beastmaster:whistle2"
+    ],
+    "subtitle": "Whistle"
+  },
+  "whistle3": {
+    "sounds": [
+      "beastmaster:whistle3"
+    ],
+    "subtitle": "Whistle"
+  }
+}
