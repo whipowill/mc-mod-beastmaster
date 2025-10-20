@@ -33,10 +33,15 @@ import net.minecraft.world.World;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.ArrayList;
 
@@ -49,6 +54,9 @@ public class BeastMasterMod implements ModInitializer {
     private static final Map<UUID, Long> playerWhistleCooldowns = new HashMap<>();
     private final Map<UUID, Long> mountBuckCooldowns = new HashMap<>();
     
+    // Dead pet registry - persists forever to prevent resurrection
+    private static final Set<UUID> globalDeadEntityRegistry = new HashSet<>();
+    
     // Whistle sounds
     public static final Identifier WHISTLE_1_ID = new Identifier(MOD_ID, "whistle1");
     public static final Identifier WHISTLE_2_ID = new Identifier(MOD_ID, "whistle2");
@@ -57,8 +65,6 @@ public class BeastMasterMod implements ModInitializer {
     public static SoundEvent WHISTLE_2_EVENT;
     public static SoundEvent WHISTLE_3_EVENT;
 
-    // Dimensions tracking
-    private static final Map<UUID, RegistryKey<World>> playerDimensions = new HashMap<>();
 
     // Interaction debouncing
     private static final Map<UUID, Long> lastInteractionSave = new HashMap<>();
@@ -69,6 +75,9 @@ public class BeastMasterMod implements ModInitializer {
 
         // Load configuration
         CONFIG = BeastConfig.load();
+        
+        // Load dead entity registry
+        loadDeadEntityRegistry();
         
         // Register whistle sounds
         WHISTLE_1_EVENT = new SoundEvent(WHISTLE_1_ID);
@@ -265,47 +274,90 @@ public class BeastMasterMod implements ModInitializer {
             // Dead entity cleanup: Every 5 minutes (6000 ticks) - much less frequent
             if (serverTime % 6000 == 0) {
                 int totalCleaned = 0;
+                int totalDeleted = 0;
+                int totalNbtCleared = 0;
+                
                 for (ServerWorld world : server.getWorlds()) {
                     PackManager manager = PackManager.get(world);
                     List<UUID> toRemove = new ArrayList<>();
 
-                    // Only check entities that are tracked in this world
+                    // Check all tracked entities in this world
                     for (PackManager.EntityData data : manager.getAllEntities()) {
-                        // Check if entity exists and is dead
-                        Entity entity = world.getEntity(data.entityUuid);
-                        if (entity != null && !entity.isAlive()) {
-                            toRemove.add(data.entityUuid);
-                            LOGGER.debug("Cleaning up dead pet: {} in {}", data.entityUuid, world.getRegistryKey().getValue());
+                        UUID entityUuid = data.entityUuid;
+                        
+                        // Check if entity is in global dead registry
+                        if (isEntityDeadGlobally(entityUuid)) {
+                            // Mark as dead and clear NBT data instead of removing immediately
+                            manager.markEntityAsDead(entityUuid);
+                            totalNbtCleared++;
+                            LOGGER.debug("Cleared NBT data for globally dead entity: {} in {}", entityUuid, world.getRegistryKey().getValue());
+                            continue;
+                        }
+                        
+                        // Check if entity is marked as dead OR if loaded entity is dead
+                        boolean shouldMarkDead = false;
+                        boolean shouldMarkGlobal = false;
+                        
+                        // Check if marked as dead in this world
+                        if (!data.isAlive) {
+                            shouldMarkDead = true;
+                            shouldMarkGlobal = true;
+                            LOGGER.debug("Cleaning up dead pet (marked dead): {} in {}", entityUuid, world.getRegistryKey().getValue());
+                        } else {
+                            // Check if loaded entity is actually dead
+                            Entity entity = world.getEntity(entityUuid);
+                            if (entity != null && !entity.isAlive()) {
+                                shouldMarkDead = true;
+                                shouldMarkGlobal = true;
+                                LOGGER.debug("Cleaning up dead pet (loaded dead): {} in {}", entityUuid, world.getRegistryKey().getValue());
+                            }
+                        }
+                        
+                        if (shouldMarkDead) {
+                            // Mark as dead and clear NBT data
+                            manager.markEntityAsDead(entityUuid);
+                            totalNbtCleared++;
+                            if (shouldMarkGlobal) {
+                                markEntityAsDeadGlobally(entityUuid);
+                            }
                         }
                     }
 
-                    // Remove dead entities from tracking
+                    // Remove entities that have been dead for a long time (clean up completely)
+                    // Keep them for a while to prevent resurrection, then remove entirely
+                    long now = System.currentTimeMillis();
+                    for (PackManager.EntityData data : manager.getAllEntities()) {
+                        if (!data.isAlive && (now - data.timestamp) > 86400000) { // 24 hours
+                            toRemove.add(data.entityUuid);
+                        }
+                    }
+
+                    // Remove old dead entities from tracking
                     for (UUID deadEntity : toRemove) {
                         manager.untrackEntity(deadEntity);
                         totalCleaned++;
                     }
+                    
+                    // Aggressive cleanup: Delete any loaded entities that are in the dead registry
+                    for (UUID deadUuid : globalDeadEntityRegistry) {
+                        Entity deadEntity = world.getEntity(deadUuid);
+                        if (deadEntity != null && deadEntity.isAlive()) {
+                            deadEntity.remove(Entity.RemovalReason.DISCARDED);
+                            totalDeleted++;
+                            LOGGER.info("Deleted globally dead entity that was still loaded: {} in {}", deadUuid, world.getRegistryKey().getValue());
+                        }
+                    }
                 }
 
-                if (totalCleaned > 0) {
-                    LOGGER.info("Cleaned up {} dead entities", totalCleaned);
+                if (totalCleaned > 0 || totalDeleted > 0 || totalNbtCleared > 0) {
+                    LOGGER.info("Cleaned up {} old dead entities, deleted {} loaded dead entities, cleared NBT for {} dead entities", 
+                        totalCleaned, totalDeleted, totalNbtCleared);
                 }
             }
         });
 
-        ServerTickEvents.END_SERVER_TICK.register(server -> {
-            for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-                RegistryKey<World> currentDimension = player.getWorld().getRegistryKey();
-                RegistryKey<World> previousDimension = playerDimensions.get(player.getUuid());
-
-                if (previousDimension != null && !previousDimension.equals(currentDimension)) {
-                    // Player changed dimensions - SUMMON their pets automatically!
-                    LOGGER.info("Player {} changed dimensions - auto-summoning pets", player.getUuid());
-                    autoSummonPlayerPets(server, player);
-                }
-
-                playerDimensions.put(player.getUuid(), currentDimension);
-            }
-        });
+        // Removed automatic pet teleportation when players change dimensions
+        // Players can manually summon pets using the whistle commands
 
         // DEBOUNCED: Save on interactions (only once per second per entity)
         UseEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
@@ -482,16 +534,58 @@ public class BeastMasterMod implements ModInitializer {
         lastInteractionSave.entrySet().removeIf(entry ->
             now - entry.getValue() > 300000);
             
-        // Clean up player dimensions (remove players that haven't been online for 10 minutes)
-        playerDimensions.entrySet().removeIf(entry -> {
-            UUID playerId = entry.getKey();
-            PlayerEntity player = null;
-            for (ServerWorld world : server.getWorlds()) {
-                player = world.getPlayerByUuid(playerId);
-                if (player != null) break;
+    }
+    
+    // Dead entity registry management
+    private void loadDeadEntityRegistry() {
+        try {
+            Path deadRegistryPath = Paths.get("config", "beastmaster_dead_entities.txt");
+            if (Files.exists(deadRegistryPath)) {
+                List<String> lines = Files.readAllLines(deadRegistryPath);
+                for (String line : lines) {
+                    try {
+                        UUID deadUuid = UUID.fromString(line.trim());
+                        globalDeadEntityRegistry.add(deadUuid);
+                    } catch (IllegalArgumentException e) {
+                        LOGGER.warn("Invalid UUID in dead registry: {}", line);
+                    }
+                }
+                LOGGER.info("Loaded {} dead entities from registry", globalDeadEntityRegistry.size());
             }
-            return player == null;
-        });
+        } catch (Exception e) {
+            LOGGER.error("Error loading dead entity registry", e);
+        }
+    }
+    
+    private void saveDeadEntityRegistry() {
+        try {
+            Path deadRegistryPath = Paths.get("config", "beastmaster_dead_entities.txt");
+            Files.createDirectories(deadRegistryPath.getParent());
+            
+            List<String> lines = new ArrayList<>();
+            for (UUID deadUuid : globalDeadEntityRegistry) {
+                lines.add(deadUuid.toString());
+            }
+            
+            Files.write(deadRegistryPath, lines);
+            LOGGER.debug("Saved {} dead entities to registry", globalDeadEntityRegistry.size());
+        } catch (Exception e) {
+            LOGGER.error("Error saving dead entity registry", e);
+        }
+    }
+    
+    public static void markEntityAsDeadGlobally(UUID entityUuid) {
+        if (!globalDeadEntityRegistry.contains(entityUuid)) {
+            globalDeadEntityRegistry.add(entityUuid);
+            // Save immediately to ensure persistence
+            BeastMasterMod instance = new BeastMasterMod(); // Temporary instance for saving
+            instance.saveDeadEntityRegistry();
+            LOGGER.info("Marked entity as permanently dead: {}", entityUuid);
+        }
+    }
+    
+    public static boolean isEntityDeadGlobally(UUID entityUuid) {
+        return globalDeadEntityRegistry.contains(entityUuid);
     }
 
     // Helper method to check if entity is supported
@@ -699,50 +793,6 @@ public class BeastMasterMod implements ModInitializer {
         return null;
     }
 
-    private static void autoSummonPlayerPets(MinecraftServer server, ServerPlayerEntity player) {
-        server.execute(() -> {
-            try {
-                UUID playerUUID = player.getUuid();
-
-                // ONLY get pets, not mounts
-                List<PackManager.EntityData> allPets = BeastMasterMod.getAllRegisteredPets(server, playerUUID);
-
-                if (allPets.isEmpty()) {
-                    return; // No pets to summon
-                }
-
-                int summonedCount = 0;
-                ServerWorld currentWorld = player.getWorld();
-
-                for (PackManager.EntityData petData : allPets) {
-                    if (!petData.isAlive) {
-                        continue; // Skip dead pets
-                    }
-
-                    try {
-                        // Use the same summoning logic as the whistle command
-                        Entity summonedPet = BeastMasterMod.loadAndTeleportEntity(server, petData, player);
-                        if (summonedPet != null) {
-                            summonedCount++;
-                        }
-                    } catch (Exception e) {
-                        LOGGER.error("Error auto-summoning pet {}", petData.entityUuid, e);
-                    }
-                }
-
-                LOGGER.info("Auto-summoned {} pets for player {} in {}",
-                    summonedCount, playerUUID, currentWorld.getRegistryKey().getValue());
-
-                if (summonedCount > 0) {
-                    //player.sendMessage(Text.of("§aYour " + summonedCount + " companion" +
-                        //(summonedCount > 1 ? "s have" : " has") + " joined you!"), false);
-                }
-
-            } catch (Exception e) {
-                LOGGER.error("Error in auto-summon", e);
-            }
-        });
-    }
 
     private MinecraftServer getServer() {
         // This is a placeholder - you'll need to track the server instance
@@ -797,6 +847,45 @@ public class BeastMasterMod implements ModInitializer {
 
             ServerWorld targetWorld = (ServerWorld) player.getWorld();
             UUID entityUuid = entityData.entityUuid;
+
+            // CRITICAL FIX: Check global dead registry first
+            if (isEntityDeadGlobally(entityUuid)) {
+                LOGGER.warn("Entity {} is in global dead registry. Cannot summon.", entityUuid);
+                // Clean up from all tracking
+                for (ServerWorld world : server.getWorlds()) {
+                    PackManager manager = PackManager.get(world);
+                    manager.untrackEntity(entityUuid);
+                }
+                return null;
+            }
+
+            // Check if entity is marked as dead in ANY world before proceeding
+            boolean isEntityDead = false;
+            for (ServerWorld world : server.getWorlds()) {
+                PackManager manager = PackManager.get(world);
+                Optional<PackManager.EntityData> data = manager.getEntityData(entityUuid);
+                if (data.isPresent() && !data.get().isAlive) {
+                    isEntityDead = true;
+                    LOGGER.warn("Entity {} is marked as DEAD in world {}. Cannot summon.", entityUuid, world.getRegistryKey().getValue());
+                    break;
+                }
+            }
+            
+            if (isEntityDead) {
+                // Mark as globally dead and clean up
+                markEntityAsDeadGlobally(entityUuid);
+                for (ServerWorld world : server.getWorlds()) {
+                    PackManager manager = PackManager.get(world);
+                    manager.untrackEntity(entityUuid);
+                    
+                    // Also remove any loaded dead entity
+                    Entity existingEntity = world.getEntity(entityUuid);
+                    if (existingEntity != null && !existingEntity.isAlive()) {
+                        existingEntity.remove(Entity.RemovalReason.DISCARDED);
+                    }
+                }
+                return null;
+            }
 
             // Remove from loaded worlds
             for (ServerWorld world : server.getWorlds()) {

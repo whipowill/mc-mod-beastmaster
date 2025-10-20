@@ -81,8 +81,6 @@ public class BeastCommand implements Command<ServerCommandSource> {
                             .executes(context -> dismissPet(context))))
                     .then(CommandManager.literal("whistle+follow")
                         .executes(context -> callAndFollowPets(context))))
-                .then(CommandManager.literal("cleanup")
-                    .executes(context -> cleanupDimensionDuplicates(context.getSource())))
             );
         });
     }
@@ -439,6 +437,10 @@ public class BeastCommand implements Command<ServerCommandSource> {
             // DEDUPLICATE: Only show the most recent entry for each UUID
             Map<UUID, PackManager.EntityData> mostRecentEntities = new HashMap<>();
             for (PackManager.EntityData entityData : ownedEntities) {
+                // FILTER OUT DEAD ENTITIES
+                if (BeastMasterMod.isEntityDeadGlobally(entityData.entityUuid)) {
+                    continue;
+                }
                 PackManager.EntityData existing = mostRecentEntities.get(entityData.entityUuid);
                 if (existing == null || entityData.timestamp > existing.timestamp) {
                     mostRecentEntities.put(entityData.entityUuid, entityData);
@@ -1276,90 +1278,6 @@ public class BeastCommand implements Command<ServerCommandSource> {
         }
     }
 
-    // Optional: Command to clean up duplicate entities across dimensions
-    private static int cleanupDimensionDuplicates(ServerCommandSource source) {
-        ServerPlayerEntity player;
-        try {
-            player = source.getPlayer();
-        } catch (CommandSyntaxException e) {
-            source.sendError(Text.of("This command can only be used by a player."));
-            return 0;
-        }
-
-        try {
-            MinecraftServer server = player.getServer();
-            UUID playerUUID = player.getUuid();
-            int cleanedCount = 0;
-            int wrongDimensionDeletions = 0;
-            int deadEntityCleanups = 0;
-
-            source.sendFeedback(Text.of("§6Starting entity cleanup..."), false);
-
-            // Perform dimension cleanup across ALL worlds
-            for (ServerWorld world : server.getWorlds()) {
-                PackManager manager = PackManager.get(world);
-
-                source.sendFeedback(Text.of("§7Checking world: " + world.getRegistryKey().getValue()), false);
-
-                int worldDeletions = 0;
-
-                // Check all loaded entities in this world
-                for (Entity entity : world.iterateEntities()) {
-                    if (!BeastMasterMod.isSupportedEntity(entity) || !BeastMasterMod.isOwned(entity)) {
-                        continue;
-                    }
-
-                    // Only clean up entities owned by the command executor
-                    if (!BeastMasterMod.isOwnedByPlayer(entity, playerUUID)) {
-                        continue;
-                    }
-
-                    java.util.Optional<PackManager.EntityData> entityData = manager.getEntityData(entity.getUuid());
-
-                    if (entityData.isPresent()) {
-                        PackManager.EntityData data = entityData.get();
-
-                        // Delete entities marked as dead
-                        if (!data.isAlive) {
-                            String entityName = entity.hasCustomName() ? entity.getCustomName().getString() : "Unnamed";
-                            source.sendFeedback(Text.of("§cDeleting dead entity: " + entityName + " in " + world.getRegistryKey().getValue()), false);
-
-                            // USE PROVEN REMOVAL METHOD
-                            entity.remove(Entity.RemovalReason.DISCARDED);
-                            deadEntityCleanups++;
-                            cleanedCount++;
-                            worldDeletions++;
-                            continue;
-                        }
-                    }
-                }
-
-                if (worldDeletions > 0) {
-                    source.sendFeedback(Text.of("§7Removed " + worldDeletions + " entities from this world"), false);
-                }
-            }
-
-            // Send summary
-            if (cleanedCount > 0) {
-                source.sendFeedback(Text.of("§aCleanup completed: " + cleanedCount + " issues resolved"), false);
-                if (wrongDimensionDeletions > 0) {
-                    source.sendFeedback(Text.of("§7- " + wrongDimensionDeletions + " wrong-dimension entities deleted"), false);
-                }
-                if (deadEntityCleanups > 0) {
-                    source.sendFeedback(Text.of("§7- " + deadEntityCleanups + " dead entities cleaned up"), false);
-                }
-            } else {
-                source.sendFeedback(Text.of("§aNo entity issues found!"), false);
-            }
-
-            return cleanedCount;
-
-        } catch (Exception e) {
-            LOGGER.error("Error cleaning up dimension duplicates", e);
-            source.sendError(Text.of("§cError during cleanup."));
-            return 0;
-        }
-    }
 
     private static int callAndFollowPets(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
         ServerCommandSource source = context.getSource();

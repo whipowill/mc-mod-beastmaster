@@ -140,16 +140,26 @@ public class PackManager extends PersistentState {
                 boolean isPet = BeastConfig.isSupportedPet(entity);
                 boolean isAlive = entity.isAlive();
 
-                NbtCompound entityNbt = new NbtCompound();
-                entity.saveNbt(entityNbt);
-                if (!entityNbt.containsUuid("UUID")) {
-                    entityNbt.putUuid("UUID", entityUuid);
+                // Don't store NBT for dead entities to save space
+                NbtCompound entityNbt = null;
+                if (isAlive) {
+                    entityNbt = new NbtCompound();
+                    entity.saveNbt(entityNbt);
+                    if (!entityNbt.containsUuid("UUID")) {
+                        entityNbt.putUuid("UUID", entityUuid);
+                    }
                 }
 
                 EntityData existingData = entityDataMap.get(entityUuid);
 
                 if (existingData != null) {
-                    existingData.entityNbt = entityNbt;
+                    // Only update NBT if entity is alive
+                    if (isAlive) {
+                        existingData.entityNbt = entityNbt;
+                    } else {
+                        // Clear NBT if entity is dead
+                        existingData.entityNbt = null;
+                    }
                     existingData.isAlive = isAlive;
                     existingData.x = pos.x;
                     existingData.y = pos.y;
@@ -179,6 +189,24 @@ public class PackManager extends PersistentState {
             }
         } catch (Exception e) {
             LOGGER.error("Error untracking entity", e);
+        }
+    }
+
+    // New method to mark entity as dead and clear NBT data
+    public void markEntityAsDead(UUID entityUuid) {
+        try {
+            EntityData data = entityDataMap.get(entityUuid);
+            if (data != null) {
+                // Clear NBT data to save space, but keep the entry for tracking dead status
+                data.entityNbt = null;
+                data.isAlive = false;
+                // Also clear custom name to save space
+                data.customName = null;
+                markDirty();
+                LOGGER.info("Marked entity as dead and cleared NBT data: {}", entityUuid);
+            }
+        } catch (Exception e) {
+            LOGGER.error("Error marking entity as dead", e);
         }
     }
 
